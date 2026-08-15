@@ -18,8 +18,10 @@ async def _load_playlists() -> Dict:
 
 async def _save_playlists(data: Dict):
     async with lock:
-        with open(PLAYLIST_FILE, "w", encoding="utf-8") as f:
+        temp_file = PLAYLIST_FILE + ".tmp"
+        with open(temp_file, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=4)
+        os.replace(temp_file, PLAYLIST_FILE)
 
 async def create_playlist(guild_id: str, name: str) -> bool:
     """Create a new playlist for the server."""

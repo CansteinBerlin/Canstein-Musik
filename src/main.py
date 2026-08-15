@@ -38,8 +38,6 @@ class Bot(commands.Bot):
     def __init__(self, *args, **kwargs):
         intents = Intents.default()
         intents.message_content = True
-        intents.typing = True
-        intents.presences = True
         intents.members = True
         intents.voice_states = True
         

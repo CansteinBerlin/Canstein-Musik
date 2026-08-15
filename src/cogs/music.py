@@ -326,7 +326,7 @@ class MusicCog(commands.Cog):
         self._progress_tasks = {}
         self.currently_playing = {}  # guild_id -> {song_data, started_at, elapsed, is_paused}
         self.guild_loops = {}  # guild_id -> 'off' | 'song' | 'queue'
-        self._play_next_locks = {}  # guild_id -> asyncio.Lock
+        self._play_next_locks = {}  # guild_id -> asyncio.Lock (DEPRECATED, kept to avoid AttributeError)
         self._now_playing_messages = {}  # guild_id -> discord.Message
         self._timeout_cache = {}  # user_id -> timeout_data (in-memory, synced to disk on change)
         self._load_timeouts()
@@ -384,7 +384,7 @@ class MusicCog(commands.Cog):
     async def send_static_message(self):
         try:
             actions_embed = self.make_embed(
-                title="Musik",
+                title="Marcante Musik",
                 description=(
                     "**/play <URL | search term>**\n"
                     "Play a song from YouTube, Spotify, SoundCloud, or other supported platforms.\n\n"
@@ -404,7 +404,7 @@ class MusicCog(commands.Cog):
             if channel:
                 def check(msg):
                     return (msg.author == self.bot.user and msg.embeds and msg.embeds[0].title and
-                            ("Musik" in msg.embeds[0].title))
+                            ("Marcante Musik" in msg.embeds[0].title or "Music" in msg.embeds[0].title))
                 try:
                     await channel.purge(limit=100, check=check, bulk=True)
                 except discord.HTTPException:
@@ -537,169 +537,335 @@ class MusicCog(commands.Cog):
         if guild.id not in guild_queues:
             return
 
-        lock = self._play_next_locks.setdefault(guild.id, asyncio.Lock())
-        async with lock:
-            music_channel = await self._get_music_channel(interaction)
-            queue = guild_queues.get(guild.id)
-            if not queue:
+        music_channel = await self._get_music_channel(interaction)
+        queue = guild_queues.get(guild.id)
+        if not queue:
+            return
+
+        async with queue.lock:
+            if voice_client.is_playing():
                 return
 
-            async with queue.lock:
-                if voice_client.is_playing():
+            next_song_data = queue.get_next()
+            if next_song_data:
+                queue.playing = True
+
+        def after_song(e):
+            if e:
+                err_str = str(e).lower()
+                logger.error(f"Playback error: {e}")
+                if any(code in err_str for code in ('403', 'forbidden', '401', 'unauthorized', '410', 'gone')):
+                    queue._last_playback_error = e
+                    asyncio.run_coroutine_threadsafe(
+                        self._retry_failed_song(guild, voice_client, interaction, next_song_data, retry_count=0),
+                        self.bot.loop
+                    )
                     return
-
-                next_song_data = queue.get_next()
-
-            def after_song(e):
-                if e:
-                    err_str = str(e).lower()
-                    logger.error(f"Playback error: {e}")
-                    if any(code in err_str for code in ('403', 'forbidden', '401', 'unauthorized', '410', 'gone')):
-                        queue._last_playback_error = e
-                        asyncio.run_coroutine_threadsafe(
-                            self._retry_failed_song(guild, voice_client, interaction, next_song_data, retry_count=0),
-                            self.bot.loop
-                        )
-                        return
-                loop_mode = self.guild_loops.get(guild.id, 'off')
-                asyncio.run_coroutine_threadsafe(
-                    self._handle_song_end(guild, queue, next_song_data, loop_mode),
-                    self.bot.loop
-                )
                 pn = self.play_next(guild, voice_client, interaction)
                 asyncio.run_coroutine_threadsafe(pn, self.bot.loop)
+                return
+            loop_mode = self.guild_loops.get(guild.id, 'off')
+            asyncio.run_coroutine_threadsafe(
+                self._handle_song_end(guild, queue, next_song_data, loop_mode),
+                self.bot.loop
+            )
+            pn = self.play_next(guild, voice_client, interaction)
+            asyncio.run_coroutine_threadsafe(pn, self.bot.loop)
 
-            if next_song_data:
-                try:
-                    logger.info(f"Playing: {next_song_data.get('title', 'Unknown')} (duration: {next_song_data.get('duration', 0)}, views: {next_song_data.get('views', 0)}, likes: {next_song_data.get('likes', 0)})")
-                    logger.info(f"Song URL: {next_song_data.get('song_url', 'Unknown')}")
-                    
-                    webpage_url = next_song_data['song_url']
+        if next_song_data:
+            try:
+                logger.info(f"Playing: {next_song_data.get('title', 'Unknown')} (duration: {next_song_data.get('duration', 0)}, views: {next_song_data.get('views', 0)}, likes: {next_song_data.get('likes', 0)})")
+                logger.info(f"Song URL: {next_song_data.get('song_url', 'Unknown')}")
 
-                    # Guard: rohe Stream-URL (videoplayback) ist unbrauchbar
-                    if 'googlevideo.com' in webpage_url or 'videoplayback' in webpage_url:
-                        rescued = (
-                            next_song_data.get('entry_data', {}).get('webpage_url')
-                            or next_song_data.get('entry_data', {}).get('original_url')
-                        )
-                        if rescued:
-                            logger.warning(f"Stream URL in song_url, rescued webpage_url: {rescued[:60]}")
-                            next_song_data['song_url'] = rescued
-                            webpage_url = rescued
-                        else:
-                            logger.warning(f"Stale stream URL, no rescue possible — skipping: {webpage_url[:80]}")
-                            queue.playing = False
-                            await self.play_next(guild, voice_client, interaction)
-                            return
+                webpage_url = next_song_data['song_url']
 
-                    preloaded = next_song_data.get('_preloaded_url')
-                    preload_age = time.time() - next_song_data.get('_preload_time', 0)
-
-                    if preloaded and preload_age < 300:
-                        stream_url = preloaded
-                        next_song_data.pop('_needs_full_extract', None)
+                if 'googlevideo.com' in webpage_url or 'videoplayback' in webpage_url:
+                    rescued = (
+                        next_song_data.get('entry_data', {}).get('webpage_url')
+                        or next_song_data.get('entry_data', {}).get('original_url')
+                    )
+                    if rescued:
+                        logger.warning(f"Stream URL in song_url, rescued webpage_url: {rescued[:60]}")
+                        next_song_data['song_url'] = rescued
+                        webpage_url = rescued
                     else:
-                        fresh_info = await song_loader.extract_info_async(webpage_url)
-
-                        if not fresh_info or "url" not in fresh_info:
-                            logger.warning(f"Failed to get fresh stream URL for {webpage_url}")
-                            try:
-                                await music_channel.send(
-                                    embed=self.make_embed(
-                                        title="⚠️ Stream unavailable",
-                                        description=f"Could not load **{next_song_data.get('title', 'Unknown')}**.\nSkipping...",
-                                        color=0xe67e22
-                                    ),
-                                    delete_after=10
-                                )
-                            except Exception:
-                                pass
+                        logger.warning(f"Stale stream URL, no rescue possible — skipping: {webpage_url[:80]}")
+                        async with queue.lock:
                             queue.playing = False
-                            await self.play_next(guild, voice_client, interaction)
-                            return
+                        asyncio.create_task(self.play_next(guild, voice_client, interaction))
+                        return
 
-                        stream_url = fresh_info["url"]
+                preloaded = next_song_data.get('_preloaded_url')
+                preload_age = time.time() - next_song_data.get('_preload_time', 0)
 
-                        if next_song_data.pop('_needs_full_extract', None):
-                            next_song_data['title'] = fresh_info.get("title", "Unknown title")
-                            next_song_data['thumbnail'] = fresh_info.get("thumbnail")
-                            next_song_data['duration'] = fresh_info.get("duration", 0)
-                            next_song_data['author'] = fresh_info.get("uploader") or fresh_info.get("creator") or fresh_info.get("artist") or "Unknown"
-                            next_song_data['likes'] = fresh_info.get("like_count") or 0
-                            next_song_data['views'] = fresh_info.get("view_count") or 0
-                            next_song_data['upload_date'] = fresh_info.get("upload_date")
-                            next_song_data['source'] = detect_source_from_entry(fresh_info)
+                if preloaded and preload_age < 300:
+                    stream_url = preloaded
+                    next_song_data.pop('_needs_full_extract', None)
+                else:
+                    fresh_info = await song_loader.extract_info_async(webpage_url)
 
-                    audio_source = await song_loader.preload_audio_source(stream_url)
-                    
-                except Exception as e:
-                    err = str(e)[:500]
-                    logger.error(f"Error extracting stream: {err}")
+                    if not fresh_info or "url" not in fresh_info:
+                        logger.warning(f"Failed to get fresh stream URL for {webpage_url}")
+                        try:
+                            await music_channel.send(
+                                embed=self.make_embed(
+                                    title="⚠️ Stream unavailable",
+                                    description=f"Could not load **{next_song_data.get('title', 'Unknown')}**.\nSkipping...",
+                                    color=0xe67e22
+                                ),
+                                delete_after=10
+                            )
+                        except Exception:
+                            pass
+                        async with queue.lock:
+                            queue.playing = False
+                        asyncio.create_task(self.play_next(guild, voice_client, interaction))
+                        return
+
+                    stream_url = fresh_info["url"]
+
+                    if next_song_data.pop('_needs_full_extract', None):
+                        next_song_data['title'] = fresh_info.get("title", "Unknown title")
+                        next_song_data['thumbnail'] = fresh_info.get("thumbnail")
+                        next_song_data['duration'] = fresh_info.get("duration", 0)
+                        next_song_data['author'] = fresh_info.get("uploader") or fresh_info.get("creator") or fresh_info.get("artist") or "Unknown"
+                        next_song_data['likes'] = fresh_info.get("like_count") or 0
+                        next_song_data['views'] = fresh_info.get("view_count") or 0
+                        next_song_data['upload_date'] = fresh_info.get("upload_date")
+                        next_song_data['source'] = detect_source_from_entry(fresh_info)
+
+                audio_source = await song_loader.preload_audio_source(stream_url)
+
+            except Exception as e:
+                err = str(e)[:500]
+                logger.error(f"Error extracting stream: {err}")
+                async with queue.lock:
                     queue.playing = False
-                    try:
-                        await music_channel.send(
-                            embed=self.make_embed(
-                                title="❌ Stream extraction failed",
-                                description=f"Could not load **{next_song_data.get('title', 'Unknown')}**.\n```{err[:200]}```",
-                                color=0xe74c3c
-                            ),
-                            delete_after=12
-                        )
-                    except Exception:
-                        pass
-                    await self.play_next(guild, voice_client, interaction)
-                    return
-
-                queue.playing = True
-                self.songs_played += 1
-
-                volume = guild_volumes.get(guild.id, 1.0)
-                audio_source = discord.PCMVolumeTransformer(audio_source, volume=volume)
-
                 try:
-                    voice_client.play(audio_source, after=after_song)
-                except Exception as e:
-                    logger.error(f"Error starting playback: {e}")
+                    await music_channel.send(
+                        embed=self.make_embed(
+                            title="❌ Stream extraction failed",
+                            description=f"Could not load **{next_song_data.get('title', 'Unknown')}**.\n```{err[:200]}```",
+                            color=0xe74c3c
+                        ),
+                        delete_after=12
+                    )
+                except Exception:
+                    pass
+                asyncio.create_task(self.play_next(guild, voice_client, interaction))
+                return
+
+            self.songs_played += 1
+
+            volume = guild_volumes.get(guild.id, 1.0)
+            audio_source = discord.PCMVolumeTransformer(audio_source, volume=volume)
+
+            try:
+                voice_client.play(audio_source, after=after_song)
+            except Exception as e:
+                logger.error(f"Error starting playback: {e}")
+                async with queue.lock:
                     queue.playing = False
+                try:
+                    await music_channel.send(
+                        embed=self.make_embed(
+                            title="❌ Playback start failed",
+                            description=f"Could not start playing **{next_song_data.get('title', 'Unknown')}**.\n```{str(e)[:200]}```",
+                            color=0xe74c3c
+                        ),
+                        delete_after=12
+                    )
+                except Exception:
+                    pass
+                asyncio.create_task(self.play_next(guild, voice_client, interaction))
+                return
+
+            self.create_background_task(self._preload_next(guild.id))
+
+            self.currently_playing[guild.id] = {
+                'song_data': next_song_data,
+                'started_at': time.time(),
+                'elapsed': 0,
+                'is_paused': False,
+            }
+
+            metadata = (
+                next_song_data['title'],
+                next_song_data['thumbnail'],
+                None,
+                next_song_data['duration'],
+                next_song_data['author'],
+                next_song_data['song_url'],
+                next_song_data['likes'],
+                next_song_data['views'],
+                next_song_data['upload_date'],
+                next_song_data.get('source', {"label": "Unknown", "icon": "🔗", "extractor": None}),
+                next_song_data.get('requested_by_name'),
+                next_song_data.get('requested_by_id'),
+            )
+
+            embed = self.create_now_playing_embed(metadata, interaction)
+            try:
+                old_msg = self._now_playing_messages.get(guild.id)
+                if old_msg:
+                    try:
+                        await old_msg.delete()
+                    except Exception:
+                        pass
+
+                np_view = NowPlayingView(self, next_song_data['title'], next_song_data['author'])
+                msg = await music_channel.send(embed=embed, view=np_view)
+                self._now_playing_messages[guild.id] = msg
+                self._schedule_progress(guild.id, msg, embed, next_song_data['duration'])
+            except Exception as e:
+                logger.error(f"Error sending now playing message: {e}")
+
+            await self._set_song_activity(next_song_data['title'], next_song_data['author'])
+        elif guild_autoplay.get(guild.id, False):
+            logger.info("autoplaying")
+
+            current = self.currently_playing.get(guild.id)
+            song_link = current.get('song_data', {}).get('song_url') if current else None
+
+            if not song_link:
+                logger.warning("No song link found for autoplay")
+                async with queue.lock:
+                    queue.playing = False
+                return
+
+            source_type = detect_source(song_link)
+            is_youtube = source_type["extractor"] == "youtube"
+
+            if not is_youtube:
+                logger.warning(f"Autoplay: non-YouTube source ({source_type['label']}) — autoplay only supported for YouTube")
+                async with queue.lock:
+                    queue.playing = False
+                return
+
+            try:
+                video_id_match = re.search(r"(?:v=|youtu\.be/)([\w-]{11})", song_link)
+                if not video_id_match:
+                    logger.warning(f"Could not extract video ID from link: {song_link}")
+                    async with queue.lock:
+                        queue.playing = False
+                    return
+
+                video_id = video_id_match.group(1)
+
+                def _fetch_related():
+                    watch = self._ytmusic.get_watch_playlist(videoId=video_id, limit=10, radio=True)
+                    tracks = watch.get("tracks", [])
+                    return [t for t in tracks if t.get("videoId") and t["videoId"] != video_id]
+
+                related_tracks = await asyncio.get_running_loop().run_in_executor(
+                    song_loader.executor, _fetch_related
+                )
+
+                if not related_tracks:
+                    logger.info("No related songs found")
+                    async with queue.lock:
+                        queue.playing = False
+                    return
+
+                suggestion = related_tracks[0]["videoId"]
+                webpage_url = f"https://www.youtube.com/watch?v={suggestion}"
+            except Exception as e:
+                logger.error(f"Autoplay suggestion error: {e}")
+                async with queue.lock:
+                    queue.playing = False
+                return
+
+            try:
+                fresh_info = await song_loader.extract_info_async(webpage_url)
+
+                if not fresh_info or "url" not in fresh_info:
+                    logger.warning(f"Failed to get fresh stream URL for {webpage_url}")
                     try:
                         await music_channel.send(
                             embed=self.make_embed(
-                                title="❌ Playback start failed",
-                                description=f"Could not start playing **{next_song_data.get('title', 'Unknown')}**.\n```{str(e)[:200]}```",
-                                color=0xe74c3c
+                                title="⚠️ Autoplay stream unavailable",
+                                description="Could not load the autoplay suggestion.\nSkipping...",
+                                color=0xe67e22
                             ),
-                            delete_after=12
+                            delete_after=10
                         )
                     except Exception:
                         pass
-                    await self.play_next(guild, voice_client, interaction)
+                    async with queue.lock:
+                        queue.playing = False
+                    asyncio.create_task(self.play_next(guild, voice_client, interaction))
                     return
 
-                self.create_background_task(self._preload_next(guild.id))
+                stream_url = fresh_info["url"]
+                audio_source = await song_loader.preload_audio_source(stream_url)
 
+            except Exception as e:
+                err = str(e)[:500]
+                logger.error(f"Autoplay extract error: {err}")
+                async with queue.lock:
+                    queue.playing = False
+                try:
+                    await music_channel.send(
+                        embed=self.make_embed(
+                            title="⚠️ Autoplay error",
+                            description=f"Could not extract autoplay audio.\n```{err[:200]}```",
+                            color=0xe74c3c
+                        ),
+                        delete_after=10
+                    )
+                except Exception:
+                    pass
+                asyncio.create_task(self.play_next(guild, voice_client, interaction))
+                return
+
+            self.songs_played += 1
+
+            volume = guild_volumes.get(guild.id, 1.0)
+            audio_source = discord.PCMVolumeTransformer(audio_source, volume=volume)
+
+            try:
+                voice_client.play(audio_source, after=after_song)
+            except Exception as e:
+                logger.error(f"Error starting autoplay playback: {e}")
+                async with queue.lock:
+                    queue.playing = False
+                try:
+                    await music_channel.send(
+                        embed=self.make_embed(
+                            title="❌ Autoplay failed",
+                            description=f"Could not start autoplay.\n```{str(e)[:200]}```",
+                            color=0xe74c3c
+                        ),
+                        delete_after=10
+                    )
+                except Exception:
+                    pass
+                return
+
+            self.create_background_task(self._preload_next(guild.id))
+
+            processed = await self.process_single_entry(fresh_info, requester=interaction.user)
+            if processed:
                 self.currently_playing[guild.id] = {
-                    'song_data': next_song_data,
+                    'song_data': processed,
                     'started_at': time.time(),
                     'elapsed': 0,
                     'is_paused': False,
                 }
-
-                metadata = (
-                    next_song_data['title'],
-                    next_song_data['thumbnail'],
+                embed = self.create_now_playing_embed((
+                    processed['title'],
+                    processed['thumbnail'],
                     None,
-                    next_song_data['duration'],
-                    next_song_data['author'],
-                    next_song_data['song_url'],
-                    next_song_data['likes'],
-                    next_song_data['views'],
-                    next_song_data['upload_date'],
-                    next_song_data.get('source', {"label": "Unknown", "icon": "🔗", "extractor": None}),
-                    next_song_data.get('requested_by_name'),
-                    next_song_data.get('requested_by_id'),
-                )
-                
-                embed = self.create_now_playing_embed(metadata, interaction)
+                    processed['duration'],
+                    processed['author'],
+                    processed['song_url'],
+                    processed['likes'],
+                    processed['views'],
+                    processed['upload_date'],
+                    processed['source'],
+                    processed.get('requested_by_name'),
+                    processed.get('requested_by_id'),
+                ), interaction)
                 try:
                     old_msg = self._now_playing_messages.get(guild.id)
                     if old_msg:
@@ -708,174 +874,21 @@ class MusicCog(commands.Cog):
                         except Exception:
                             pass
 
-                    np_view = NowPlayingView(self, next_song_data['title'], next_song_data['author'])
+                    np_view = NowPlayingView(self, processed['title'], processed['author'])
                     msg = await music_channel.send(embed=embed, view=np_view)
                     self._now_playing_messages[guild.id] = msg
-                    self._schedule_progress(guild.id, msg, embed, next_song_data['duration'])
+                    self._schedule_progress(guild.id, msg, embed, processed['duration'])
                 except Exception as e:
                     logger.error(f"Error sending now playing message: {e}")
 
-                await self._set_song_activity(next_song_data['title'], next_song_data['author'])
-            elif guild_autoplay.get(guild.id, False):
-                logger.info("autoplaying")
+                await self._set_song_activity(processed['title'], processed['author'])
 
-                current = self.currently_playing.get(guild.id)
-                song_link = current.get('song_data', {}).get('song_url') if current else None
-
-                if not song_link:
-                    logger.warning("No song link found for autoplay")
-                    queue.playing = False
-                    return
-
-                source_type = detect_source(song_link)
-                is_youtube = source_type["extractor"] == "youtube"
-
-                if not is_youtube:
-                    logger.warning(f"Autoplay: non-YouTube source ({source_type['label']}) — autoplay only supported for YouTube")
-                    queue.playing = False
-                    return
-
-                try:
-                    video_id_match = re.search(r"(?:v=|youtu\.be/)([\w-]{11})", song_link)
-                    if not video_id_match:
-                        logger.warning(f"Could not extract video ID from link: {song_link}")
-                        queue.playing = False
-                        return
-
-                    video_id = video_id_match.group(1)
-
-                    def _fetch_related():
-                        watch = self._ytmusic.get_watch_playlist(videoId=video_id, limit=10, radio=True)
-                        tracks = watch.get("tracks", [])
-                        return [t for t in tracks if t.get("videoId") and t["videoId"] != video_id]
-
-                    related_tracks = await asyncio.get_running_loop().run_in_executor(
-                        song_loader.executor, _fetch_related
-                    )
-
-                    if not related_tracks:
-                        logger.info("No related songs found")
-                        queue.playing = False
-                        return
-
-                    suggestion = related_tracks[0]["videoId"]
-                    webpage_url = f"https://www.youtube.com/watch?v={suggestion}"
-                except Exception as e:
-                    logger.error(f"Autoplay suggestion error: {e}")
-                    queue.playing = False
-                    return
-
-                try:
-                    fresh_info = await song_loader.extract_info_async(webpage_url)
-
-                    if not fresh_info or "url" not in fresh_info:
-                        logger.warning(f"Failed to get fresh stream URL for {webpage_url}")
-                        try:
-                            await music_channel.send(
-                                embed=self.make_embed(
-                                    title="⚠️ Autoplay stream unavailable",
-                                    description="Could not load the autoplay suggestion.\nSkipping...",
-                                    color=0xe67e22
-                                ),
-                                delete_after=10
-                            )
-                        except Exception:
-                            pass
-                        queue.playing = False
-                        await self.play_next(guild, voice_client, interaction)
-                        return
-
-                    stream_url = fresh_info["url"]
-                    audio_source = await song_loader.preload_audio_source(stream_url)
-
-                except Exception as e:
-                    err = str(e)[:500]
-                    logger.error(f"Autoplay extract error: {err}")
-                    queue.playing = False
-                    try:
-                        await music_channel.send(
-                            embed=self.make_embed(
-                                title="⚠️ Autoplay error",
-                                description=f"Could not extract autoplay audio.\n```{err[:200]}```",
-                                color=0xe74c3c
-                            ),
-                            delete_after=10
-                        )
-                    except Exception:
-                        pass
-                    await self.play_next(guild, voice_client, interaction)
-                    return
-
-                queue.playing = True
-                self.songs_played += 1
-
-                volume = guild_volumes.get(guild.id, 1.0)
-                audio_source = discord.PCMVolumeTransformer(audio_source, volume=volume)
-
-                try:
-                    voice_client.play(audio_source, after=after_song)
-                except Exception as e:
-                    logger.error(f"Error starting autoplay playback: {e}")
-                    queue.playing = False
-                    try:
-                        await music_channel.send(
-                            embed=self.make_embed(
-                                title="❌ Autoplay failed",
-                                description=f"Could not start autoplay.\n```{str(e)[:200]}```",
-                                color=0xe74c3c
-                            ),
-                            delete_after=10
-                        )
-                    except Exception:
-                        pass
-                    return
-
-                self.create_background_task(self._preload_next(guild.id))
-
-                processed = await self.process_single_entry(fresh_info, requester=interaction.user)
-                if processed:
-                    self.currently_playing[guild.id] = {
-                        'song_data': processed,
-                        'started_at': time.time(),
-                        'elapsed': 0,
-                        'is_paused': False,
-                    }
-                    embed = self.create_now_playing_embed((
-                        processed['title'],
-                        processed['thumbnail'],
-                        None,
-                        processed['duration'],
-                        processed['author'],
-                        processed['song_url'],
-                        processed['likes'],
-                        processed['views'],
-                        processed['upload_date'],
-                        processed['source'],
-                        processed.get('requested_by_name'),
-                        processed.get('requested_by_id'),
-                    ), interaction)
-                    try:
-                        old_msg = self._now_playing_messages.get(guild.id)
-                        if old_msg:
-                            try:
-                                await old_msg.delete()
-                            except Exception:
-                                pass
-
-                        np_view = NowPlayingView(self, processed['title'], processed['author'])
-                        msg = await music_channel.send(embed=embed, view=np_view)
-                        self._now_playing_messages[guild.id] = msg
-                        self._schedule_progress(guild.id, msg, embed, processed['duration'])
-                    except Exception as e:
-                        logger.error(f"Error sending now playing message: {e}")
-
-                    await self._set_song_activity(processed['title'], processed['author'])
-
-            else:
-                logger.info("queue stopped")
+        else:
+            logger.info("queue stopped")
+            async with queue.lock:
                 queue.playing = False
-                self.currently_playing.pop(guild.id, None)
-                await self._reset_activity()
+            self.currently_playing.pop(guild.id, None)
+            await self._reset_activity()
 
     def create_now_playing_embed(self, metadata, interaction):
         title, thumbnail, _, duration, author, song_url, likes, views, upload_date, source, req_name, req_id = metadata
@@ -1236,7 +1249,7 @@ class MusicCog(commands.Cog):
                         song_loader.executor, extract_playlist_info
                     )
 
-                    if "entries" in chart_info and chart_info["entries"]:
+                    if chart_info and "entries" in chart_info and chart_info["entries"]:
                         for entry in chart_info["entries"][:15]:
                             if entry and entry.get("title"):
                                 title = entry["title"]
@@ -1265,7 +1278,7 @@ class MusicCog(commands.Cog):
                     for search_query in search_queries:
                         try:
                             search_results = await song_loader.extract_info_async(search_query)
-                            if "entries" in search_results:
+                            if search_results and "entries" in search_results:
                                 for entry in search_results["entries"][:5]:
                                     if entry and entry.get("title"):
                                         title = entry["title"]
@@ -1386,7 +1399,7 @@ class MusicCog(commands.Cog):
 
         queue = guild_queues[interaction.guild.id]
 
-        song_entry = info["entries"][0] if "entries" in info and info["entries"] else info
+        song_entry = info["entries"][0] if info and "entries" in info and info["entries"] else info
 
         processed_song = await self.process_single_entry(song_entry, requester=interaction.user)
         if not processed_song:
@@ -2233,9 +2246,11 @@ class MusicCog(commands.Cog):
 
     def _save_timeouts(self):
         timeout_file = "timeouts.json"
+        temp_file = timeout_file + ".tmp"
         try:
-            with open(timeout_file, 'w') as f:
+            with open(temp_file, 'w') as f:
                 json.dump({str(k): v for k, v in self._timeout_cache.items()}, f, indent=2)
+            os.replace(temp_file, timeout_file)
         except Exception as e:
             logger.error(f"Error saving timeout file: {e}")
 

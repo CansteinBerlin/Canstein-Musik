@@ -70,6 +70,7 @@ class NowPlayingView(View):
         lyrics_btn = Button(label="Lyrics", emoji="🎤", style=PURPLE, row=0)
         lyrics_btn.callback = self.lyrics_callback
         self.add_item(lyrics_btn)
+        self.lyrics_button = lyrics_btn
     
     async def play_pause_callback(self, interaction: discord.Interaction):
         try:
@@ -137,8 +138,8 @@ class NowPlayingView(View):
             await interaction.response.send_message("An error occurred.", ephemeral=True)
     
     async def lyrics_callback(self, interaction: discord.Interaction):
-        button = interaction.message.components[0].children[3]  # Lyrics button
-        button.disabled = True
+        if hasattr(self, "lyrics_button"):
+            self.lyrics_button.disabled = True
         await interaction.response.edit_message(view=self)
         
         loading_embed = discord.Embed(

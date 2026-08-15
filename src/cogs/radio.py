@@ -18,12 +18,12 @@ class RadioCog(commands.Cog):
             timeout=aiohttp.ClientTimeout(total=10),
             headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
         )
-        self.bot.tree.add_command(self.radio_command, guild=discord.Object(id=SYNC_SERVER))
         
     async def cog_unload(self):
         if self.session:
             await self.session.close()
         
+    @app_commands.guilds(discord.Object(id=SYNC_SERVER))
     @app_commands.command(name="radio", description="Play a radio stream")
     @app_commands.describe(choice="Choose a Radio sender, or type in your own!")
     @app_commands.choices(choice=[
@@ -57,7 +57,7 @@ class RadioCog(commands.Cog):
                 color=0xFF4444
             )
             embed.set_author(name=interaction.user.display_name, icon_url=interaction.user.display_avatar.url)
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await self._safe_respond(interaction, embed=embed, ephemeral=True)
             return
 
         voice_channel = interaction.user.voice.channel
@@ -70,7 +70,7 @@ class RadioCog(commands.Cog):
                 color=0xFFAA00
             )
             embed.set_author(name=interaction.user.display_name, icon_url=interaction.user.display_avatar.url)
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await self._safe_respond(interaction, embed=embed, ephemeral=True)
             return
 
         if voice_client and voice_client.is_playing():
@@ -94,7 +94,7 @@ class RadioCog(commands.Cog):
                 inline=False
             )
             embed.set_author(name=interaction.user.display_name, icon_url=interaction.user.display_avatar.url)
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await self._safe_respond(interaction, embed=embed, ephemeral=True)
             return
         
         loading_embed = discord.Embed(
@@ -106,7 +106,7 @@ class RadioCog(commands.Cog):
         loading_embed.add_field(name="🎵 Status", value="Connecting...", inline=True)
         loading_embed.set_author(name=interaction.user.display_name, icon_url=interaction.user.display_avatar.url)
         
-        await interaction.response.send_message(embed=loading_embed, ephemeral=True)
+        await self._safe_respond(interaction, embed=loading_embed, ephemeral=True)
 
         try:
             processed_url = await self._process_stream_url(stream_url)
@@ -118,7 +118,7 @@ class RadioCog(commands.Cog):
                 )
                 error_embed.add_field(name="🔗 URL", value=f"```{stream_url[:100]}{'...' if len(stream_url) > 100 else ''}```", inline=False)
                 error_embed.set_author(name=interaction.user.display_name, icon_url=interaction.user.display_avatar.url)
-                await interaction.followup.send(embed=error_embed, ephemeral=True)
+                await self._safe_followup(interaction, embed=error_embed, ephemeral=True)
                 return
                 
             stream_url = processed_url
@@ -131,7 +131,7 @@ class RadioCog(commands.Cog):
             )
             error_embed.add_field(name="🐛 Error Details", value=f"```{str(e)[:500]}```", inline=False)
             error_embed.set_author(name=interaction.user.display_name, icon_url=interaction.user.display_avatar.url)
-            await interaction.followup.send(embed=error_embed, ephemeral=True)
+            await self._safe_followup(interaction, embed=error_embed, ephemeral=True)
             return
         
         await interaction.delete_original_response()
@@ -141,7 +141,7 @@ class RadioCog(commands.Cog):
             await self._play_radio_stream(voice_client, stream_url)
             
             embed = self._create_radio_embed(interaction.user, radio_name, stream_url, voice_channel)
-            await interaction.followup.send(embed=embed)
+            await self._safe_followup(interaction, embed=embed)
             
         except discord.ClientException as e:
             error_embed = discord.Embed(
@@ -152,7 +152,7 @@ class RadioCog(commands.Cog):
             error_embed.add_field(name="🐛 Error Details", value=f"```{str(e)[:500]}```", inline=False)
             error_embed.add_field(name="💡 Suggestion", value="Try selecting a different radio station or check if the URL is valid.", inline=False)
             error_embed.set_author(name=interaction.user.display_name, icon_url=interaction.user.display_avatar.url)
-            await interaction.followup.send(embed=error_embed)
+            await self._safe_followup(interaction, embed=error_embed)
             await self._cleanup_voice_client(voice_client)
                 
         except FileNotFoundError:
@@ -167,7 +167,7 @@ class RadioCog(commands.Cog):
                 inline=False
             )
             error_embed.set_author(name=interaction.user.display_name, icon_url=interaction.user.display_avatar.url)
-            await interaction.followup.send(embed=error_embed)
+            await self._safe_followup(interaction, embed=error_embed)
             await self._cleanup_voice_client(voice_client)
                 
         except Exception as e:
@@ -179,7 +179,7 @@ class RadioCog(commands.Cog):
             error_embed.add_field(name="🐛 Error Details", value=f"```{str(e)[:500]}```", inline=False)
             error_embed.add_field(name="💡 Suggestion", value="Please try again or contact support if the issue persists.", inline=False)
             error_embed.set_author(name=interaction.user.display_name, icon_url=interaction.user.display_avatar.url)
-            await interaction.followup.send(embed=error_embed)
+            await self._safe_followup(interaction, embed=error_embed)
             await self._cleanup_voice_client(voice_client)
 
     async def _process_stream_url(self, url: str) -> Optional[str]:
@@ -311,6 +311,19 @@ class RadioCog(commands.Cog):
         embed.timestamp = discord.utils.utcnow()
         
         return embed
+
+    async def _safe_followup(self, interaction: discord.Interaction, **kwargs):
+        try:
+            return await interaction.followup.send(**kwargs)
+        except (discord.NotFound, discord.HTTPException) as e:
+            logger.warning(f"Followup send failed (interaction likely expired): {e}")
+            return None
+
+    async def _safe_respond(self, interaction: discord.Interaction, **kwargs):
+        try:
+            return await interaction.response.send_message(**kwargs)
+        except (discord.NotFound, discord.HTTPException) as e:
+            logger.warning(f"Response send failed (interaction likely expired): {e}")
 
     async def _cleanup_voice_client(self, voice_client: Optional[discord.VoiceClient]):
         if voice_client and voice_client.is_connected():
