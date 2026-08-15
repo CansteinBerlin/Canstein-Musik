@@ -1,5 +1,5 @@
 TEXTS = {
-    "BOT_NAME": "Maik",
+    "BOT_NAME": "Musik",
     "ERROR": "❌ Fehler",
     "NO_PERMISSION_TITLE": "Keine Berechtigung",
     "NO_PERMISSION": "Du hast keine Berechtigung für diesen Befehl.",
